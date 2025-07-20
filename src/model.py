@@ -7,117 +7,161 @@ Created on Fri Jun  6 16:50:23 2025
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-
-#Settings
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-Z_DIM = 256 
-NUM_EPOCHS = 200
-BATCH_SIZE = 256
-LR_RATE = 1e-4
+from torchvision.models import resnet50, ResNet50_Weights
 
 
-class Encoder(nn.Module):
-    def __init__(self, z_dim):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels= 3,
-                               out_channels= 32,
-                               kernel_size= 4,
-                               stride= 2,
-                               padding= 1)
+
+class Resnet_Encoder(nn.Module):
+    """
+    Encoder baseado na ResNet-50 pré-treinada para gerar vetores latentes (mu, logvar).
+    Este encoder remove a última camada totalmente conectada da ResNet-50 e adiciona duas
+    camadas lineares para estimar a média (mu) e o logaritmo da variância (logvar) da
+    distribuição latente de cada entrada.
+
+    Parâmetros:
+        z_dim (int): dimensionalidade do espaço latente (tamanho de cada vetor z).
+    """
+
+    def __init__(self, z_dim=256):
+        super(Resnet_Encoder, self).__init__()
+
+        # Carrega a ResNet-50 com pesos pré-treinados do ImageNet
+        resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+
+        # Remove a última camada totalmente conectada (classificadora)
+        modules = list(resnet.children())[:-1]
+        self.resnet_base = nn.Sequential(*modules)
+
+        # Permite o fine-tuning da base da ResNet (opcional)
+        for param in self.resnet_base.parameters():
+            param.requires_grad = True
+
+        # Camadas lineares para gerar os parâmetros da distribuição latente
+        self.fc_mu = nn.Linear(resnet.fc.in_features, z_dim)       # média do vetor latente
+        self.fc_logvar = nn.Linear(resnet.fc.in_features, z_dim)   # log variância do vetor latente
         
-        self.conv2 = nn.Conv2d(in_channels= 32,
-                               out_channels= 64,
-                               kernel_size= 4,
-                               stride= 2,
-                               padding= 1)
-        
-        self.conv3 = nn.Conv2d(in_channels= 64,
-                               out_channels= 128,
-                               kernel_size= 4,
-                               stride= 2,
-                               padding= 1)
-        
-        self.conv4 = nn.Conv2d(in_channels= 128,
-                               out_channels= 256,
-                               kernel_size= 4,
-                               stride= 2,
-                               padding= 1)
-        
-        self.flattern = nn.Flatten()
-        self.mu = nn.Linear(256*16*16, z_dim)
-        self.sigma = nn.Linear(256*16*16, z_dim)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x)) #256 -> 128
-        x = F.relu(self.conv2(x)) #128 -> 64
-        x = F.relu(self.conv3(x)) #64 -> 32
-        x = F.relu(self.conv4(x)) #32 -> 16
+        """
+        Processa uma entrada x e retorna os parâmetros da distribuição latente.
+    
+        Parâmetros:
+            x: Tensor de entrada com shape [batch_size, 3, H, W]
+    
+        Retorna:
+            mu: Tensor com a média dos vetores latentes (shape: [batch_size, z_dim])
+            logvar: Tensor com o log da variância dos vetores latentes (shape: [batch_size, z_dim])
+        """
+        x = self.resnet_base(x)           # Extrai características convolucionais
+        x = torch.flatten(x, 1)           # Achata o tensor (mantendo dimensão batch)
+        mu = self.fc_mu(x)                # Gera a média do vetor latente
+        logvar = self.fc_logvar(x)        # Gera o log da variância do vetor latente
+        return mu, logvar   
+    
 
-        x = self.flattern(x)
-        mu = self.mu(x)
-        sigma = self.sigma(x)
-        return mu, sigma
-    
-    
+
 class Decoder(nn.Module):
-    def __init__(self, z_dim=128):
-        super().__init__()
-        self.fc = nn.Linear(z_dim, 256*16*16)
-        self.deconv1 = nn.ConvTranspose2d(in_channels= 256,
-                                          out_channels= 128,
-                                          kernel_size= 4,
-                                          stride= 2,
-                                          padding= 1)
-        
-        self.deconv2 = nn.ConvTranspose2d(in_channels= 128,
-                                          out_channels= 64,
-                                          kernel_size= 4,
-                                          stride= 2,
-                                          padding= 1)
-        
-        self.deconv3 = nn.ConvTranspose2d(in_channels= 64,
-                                          out_channels= 32,
-                                          kernel_size= 4,
-                                          stride= 2,
-                                          padding= 1)
-        
-        self.deconv4 = nn.ConvTranspose2d(in_channels= 32,
-                                          out_channels= 3,
-                                          kernel_size= 4,
-                                          stride= 2,
-                                          padding= 1)
+    """
+    Este decoder recebe um vetor latente `z`, transforma esse vetor em um mapa de características
+    inicial com `fc`, e o reconstrói progressivamente usando camadas transpostas
+    (ConvTranspose2d) até obter uma imagem RGB de tamanho 224x224.
 
-    def forward(self, z):
-        x = self.fc(z)
-        x = x.view(-1, 256, 16, 16) #desfaz o flattern
-        x = F.relu(self.deconv1(x)) # 16 -> 32
-        x = F.relu(self.deconv2(x)) # 32 -> 64
-        x = F.relu(self.deconv3(x)) # 64 -> 128
-        x = torch.tanh(self.deconv4(x)) # 128 -> 256
+    Parâmetros:
+        z_dim (int): dimensionalidade do espaço latente (tamanho de cada vetor z).
+    """
+
+    def __init__(self, z_dim=256):
+        super(Decoder, self).__init__()
+
+        # Camada totalmente conectada: transforma z em volume 3D inicial
+        self.fc = nn.Linear(z_dim, 512 * 7 * 7)
+
+        # Camadas deconvolucionais para upsampling progressivo
+        self.deconv_layers = nn.Sequential(
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),  # 7x7 -> 14x14
+            nn.ReLU(),
+
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),  # 14x14 -> 28x28
+            nn.ReLU(),
+
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),   # 28x28 -> 56x56
+            nn.ReLU(),
+
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),    # 56x56 -> 112x112
+            nn.ReLU(),
+
+            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),     # 112x112 -> 224x224
+            nn.Sigmoid()  # Normaliza saída para [0,1] (como uma imagem RGB)
+        )
+
+    def forward(self, x):
+        """
+        Reconstrói uma imagem a partir de um vetor latente.
+
+        Parâmetros:
+            x: Tensor com shape [batch_size, z_dim]
+
+        Retorna:
+            Tensor de imagem reconstruída com shape [batch_size, 3, 224, 224]
+        """
+        x = self.fc(x)                     # Transforma vetor z em volume 3D inicial
+        x = x.view(-1, 512, 7, 7)          # Redimensiona para volume 3D
+        x = self.deconv_layers(x)         # Reconstrói imagem com camadas transpostas
         return x
 
 
-class VariationalAutoencoder(nn.Module):
-    def __init__(self, z_dim=128):
-        super().__init__()
-        self.encoder = Encoder(z_dim)
+
+
+class VAE_I2DL(nn.Module):
+    """
+    Este modelo segue a estrutura típica de um VAE:
+    - Um encoder que mapeia a imagem de entrada para os parâmetros (mu, logvar) de uma
+      distribuição Gaussiana no espaço latente.
+    - Um truque de reparametrização para permitir o backpropagation através da amostragem.
+    - Um decoder que reconstrói a imagem a partir do vetor latente amostrado.
+
+    Parâmetros:
+        z_dim (int): dimensionalidade do espaço latente (tamanho de cada vetor z).
+    """
+
+    def __init__(self, z_dim=256):
+        super(VAE_I2DL, self).__init__()
+
+        # Encoder que extrai mu e logvar a partir de uma imagem de entrada
+        self.encoder = Resnet_Encoder(z_dim)
+
+        # Decoder que reconstrói a imagem a partir do vetor latente z
         self.decoder = Decoder(z_dim)
 
-    def reparameterize_trick(self, mu, sigma):
-        std = torch.exp(sigma/2)
-        epsilon = torch.randn_like(std)  #ruído gaussiano do mesmo shape do std
-        return mu + epsilon * std
-
     def forward(self, x):
-        mu, sigma = self.encoder(x)
-        z = self.reparameterize_trick(mu, sigma)
-        x_reconstructed = self.decoder(z)
-        return x_reconstructed, mu, sigma
-    
-    
-def loss_function(x_reconstructed, x, mu, sigma):
-    recon_loss = F.mse_loss(x_reconstructed, x, reduction='sum')
-    kl_divergence = -0.5 * torch.sum(1 + sigma - mu.pow(2) - sigma.exp())
-    return recon_loss + kl_divergence, recon_loss, kl_divergence
+        """
+        Executa o fluxo completo do VAE: codificação, amostragem e decodificação.
+
+        Parâmetros:
+            x: Tensor de imagem de entrada com shape [batch_size, 3, 224, 224]
+
+        Retorna:
+            recon_x: imagem reconstruída
+            mu: média da distribuição latente
+            logvar: log da variância da distribuição latente
+        """
+        mu, logvar = self.encoder(x)              # Codifica entrada para parâmetros da distribuição
+        z = self.reparameterize_trick(mu, logvar) # Amostra vetor latente z
+        recon_x = self.decoder(z)                 # Reconstrói a imagem
+        return recon_x, mu, logvar
+
+    def reparameterize_trick(self, mu, logvar):
+        """
+        Aplica o truque de reparametrização para permitir o backpropagation através da amostragem.
+
+        Parâmetros:
+            mu: média da distribuição latente (tensor)
+            logvar: log da variância (tensor)
+
+        Retorna:
+            z: vetor latente amostrado com ruído (mu + eps * std)
+        """
+        std = torch.exp(0.5 * logvar)           # Desvio padrão = sqrt(var) = exp(0.5 * logvar)
+        eps = torch.randn_like(std)            # Ruído amostrado da N(0,1)
+        z = mu + eps * std                     # Amostragem com reparametrização
+        return z
