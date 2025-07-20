@@ -19,8 +19,9 @@ def main():
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     LEARNING_RATE = 1e-4
     set_seed(2025)
-    AMOSTRA_FOLDER = 'xxxxx'
-    VAL_FOLDER = 'xxxx'
+    AMOSTRA_FOLDER = '../dateset/Amostra_Diagset/'
+    VAL_FOLDER = '../dateset/Valid_Diagset/'
+    
     
     transform = transforms.Compose([transforms.ToPILImage(),
                                     transforms.Resize((224,224)),
